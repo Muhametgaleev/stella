@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+grammar/*.tokens
+grammar/*.interp
+grammar/*.py
+tests/stella_test_suite/
