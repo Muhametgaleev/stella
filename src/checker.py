@@ -4,7 +4,8 @@ from typing import Optional, List, Dict, Tuple, Set
 from stella_types import (
     StellaType, TypeBool, TypeNat, TypeUnit,
     TypeFun, TypeTuple, TypeRecord, TypeSum, TypeList, TypeVariant,
-    BOOL, NAT, UNIT
+    TypeTop, TypeBottom, TypeRef,
+    BOOL, NAT, UNIT, TOP, BOTTOM
 )
 from errors import (
     TypeCheckError,
@@ -19,7 +20,11 @@ from errors import (
     ERROR_AMBIGUOUS_LIST, ERROR_ILLEGAL_EMPTY_MATCHING, ERROR_NONEXHAUSTIVE_MATCH_PATTERNS,
     ERROR_UNEXPECTED_PATTERN_FOR_TYPE, ERROR_DUPLICATE_RECORD_FIELDS,
     ERROR_DUPLICATE_RECORD_TYPE_FIELDS, ERROR_DUPLICATE_VARIANT_TYPE_FIELDS,
-    ERROR_DUPLICATE_FUNCTION_DECLARATION
+    ERROR_DUPLICATE_FUNCTION_DECLARATION,
+    ERROR_EXCEPTION_TYPE_NOT_DECLARED, ERROR_AMBIGUOUS_THROW_TYPE,
+    ERROR_AMBIGUOUS_REFERENCE_TYPE, ERROR_AMBIGUOUS_PANIC_TYPE,
+    ERROR_NOT_A_REFERENCE, ERROR_UNEXPECTED_MEMORY_ADDRESS,
+    ERROR_UNEXPECTED_REFERENCE, ERROR_UNEXPECTED_SUBTYPE,
 )
 from context import TypeEnv
 from pretty import pretty_type, pretty_expr
@@ -40,6 +45,15 @@ class TypeChecker:
         self.has_fixpoint = '#fixpoint-combinator' in extensions
         self.has_type_ascriptions = '#type-ascriptions' in extensions
 
+        self.exception_type = None
+        self.structural_subtyping = '#structural-subtyping' in extensions
+        self.ambiguous_as_bottom = '#ambiguous-type-as-bottom' in extensions
+        self.has_sequencing = '#sequencing' in extensions
+        self.has_references = '#references' in extensions
+        self.has_exceptions = '#exceptions' in extensions
+        self.has_type_cast = '#type-cast' in extensions
+        self.has_panic = '#panic' in extensions
+
         self.type_aliases: Dict[str, StellaType] = {}
 
     def parse_type(self, ctx) -> StellaType:
@@ -51,6 +65,12 @@ class TypeChecker:
             return NAT
         elif name == 'TypeUnitContext':
             return UNIT
+        elif name == 'TypeTopContext':
+            return TOP
+        elif name == 'TypeBottomContext':
+            return BOTTOM
+        elif name == 'TypeRefContext':
+            return TypeRef(self.parse_type(ctx.type_))
         elif name == 'TypeFunContext':
             param_types = [self.parse_type(p) for p in ctx.paramTypes]
             ret_type = self.parse_type(ctx.returnType)
@@ -110,19 +130,75 @@ class TypeChecker:
                 f"Unknown type context: {name}"
             )
 
+    def is_subtype(self, sub: StellaType, sup: StellaType) -> bool:
+        if isinstance(sub, TypeBottom):
+            return True
+        if isinstance(sup, TypeTop):
+            return True
+        if sub == sup:
+            return True
+        if isinstance(sub, TypeFun) and isinstance(sup, TypeFun):
+            if len(sub.param_types) != len(sup.param_types):
+                return False
+            for sp, pp in zip(sup.param_types, sub.param_types):
+                if not self.is_subtype(sp, pp):
+                    return False
+            return self.is_subtype(sub.return_type, sup.return_type)
+        if isinstance(sub, TypeTuple) and isinstance(sup, TypeTuple):
+            if len(sub.types) != len(sup.types):
+                return False
+            return all(self.is_subtype(s, p) for s, p in zip(sub.types, sup.types))
+        if isinstance(sub, TypeRecord) and isinstance(sup, TypeRecord):
+            sub_dict = dict(sub.fields)
+            for label, sup_type in sup.fields:
+                if label not in sub_dict:
+                    return False
+                if not self.is_subtype(sub_dict[label], sup_type):
+                    return False
+            return True
+        if isinstance(sub, TypeVariant) and isinstance(sup, TypeVariant):
+            sup_dict = dict(sup.fields)
+            for label, sub_type in sub.fields:
+                if label not in sup_dict:
+                    return False
+                sup_type2 = sup_dict[label]
+                if sub_type is not None and sup_type2 is not None:
+                    if not self.is_subtype(sub_type, sup_type2):
+                        return False
+            return True
+        if isinstance(sub, TypeRef) and isinstance(sup, TypeRef):
+            return sub.inner_type == sup.inner_type
+        if isinstance(sub, TypeList) and isinstance(sup, TypeList):
+            return self.is_subtype(sub.element_type, sup.element_type)
+        if isinstance(sub, TypeSum) and isinstance(sup, TypeSum):
+            return self.is_subtype(sub.left, sup.left) and self.is_subtype(sub.right, sup.right)
+        return False
+
     def _expect_type(self, expr, actual: StellaType, expected: StellaType):
-        if actual != expected:
-            raise TypeCheckError(
-                ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
-                f"Expected type {pretty_type(expected)}, but got {pretty_type(actual)}"
-                + (f" for expression {pretty_expr(expr)}" if expr is not None else "")
-            )
+        if self.structural_subtyping:
+            if not self.is_subtype(actual, expected):
+                raise TypeCheckError(
+                    ERROR_UNEXPECTED_SUBTYPE,
+                    f"Expected type {pretty_type(expected)}, but got {pretty_type(actual)}"
+                    + (f" for expression {pretty_expr(expr)}" if expr is not None else "")
+                )
+        else:
+            if actual != expected:
+                raise TypeCheckError(
+                    ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
+                    f"Expected type {pretty_type(expected)}, but got {pretty_type(actual)}"
+                    + (f" for expression {pretty_expr(expr)}" if expr is not None else "")
+                )
 
     def check_program(self, program_ctx):
         for decl in program_ctx.decls:
             if decl.__class__.__name__ == 'DeclTypeAliasContext':
                 name = decl.name.text
                 self.type_aliases[name] = self.parse_type(decl.atype)
+
+        for decl in program_ctx.decls:
+            if decl.__class__.__name__ == 'DeclExceptionTypeContext':
+                self.exception_type = self.parse_type(decl.exceptionType)
 
         seen_names = set()
         for decl in program_ctx.decls:
@@ -358,6 +434,51 @@ class TypeChecker:
             self.check(expr.right, BOOL, env)
             return BOOL
 
+        if name == 'SequenceContext':
+            self.check(expr.expr1, UNIT, env)
+            return self._infer(expr.expr2, env, expected)
+
+        if name == 'RefContext':
+            return self._infer_ref(expr, env, expected)
+
+        if name == 'DerefContext':
+            return self._infer_deref(expr, env)
+
+        if name == 'AssignContext':
+            return self._infer_assign(expr, env)
+
+        if name == 'ConstMemoryContext':
+            return self._infer_const_memory(expr, env, expected)
+
+        if name == 'PanicContext':
+            return self._infer_panic(expr, env, expected)
+
+        if name == 'ThrowContext':
+            return self._infer_throw(expr, env, expected)
+
+        if name == 'TryWithContext':
+            if expected is not None:
+                try_type = self._infer(expr.tryExpr, env, expected)
+                self._expect_type(expr.tryExpr, try_type, expected)
+                fallback_type = self._infer(expr.fallbackExpr, env, expected)
+                self._expect_type(expr.fallbackExpr, fallback_type, expected)
+                return expected
+            else:
+                try_type = self.infer(expr.tryExpr, env)
+                fallback_type = self._infer(expr.fallbackExpr, env, try_type)
+                self._expect_type(expr.fallbackExpr, fallback_type, try_type)
+                return try_type
+
+        if name == 'TryCatchContext':
+            return self._infer_try_catch(expr, env, expected)
+
+        if name == 'TypeCastContext':
+            self._infer(expr.expr_, env, None)
+            return self.parse_type(expr.type_)
+
+        if name == 'TryCastAsContext':
+            return self._infer_try_cast_as(expr, env, expected)
+
         raise TypeCheckError(
             ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
             f"Unsupported expression type: {name}"
@@ -500,20 +621,25 @@ class TypeChecker:
                     f"Missing record fields: {', '.join(sorted(missing))}"
                 )
 
-            extra = provided_labels - expected_labels
-            if extra:
-                raise TypeCheckError(
-                    ERROR_UNEXPECTED_RECORD_FIELDS,
-                    f"Unexpected record fields: {', '.join(sorted(extra))}"
-                )
+            if not self.structural_subtyping:
+                extra = provided_labels - expected_labels
+                if extra:
+                    raise TypeCheckError(
+                        ERROR_UNEXPECTED_RECORD_FIELDS,
+                        f"Unexpected record fields: {', '.join(sorted(extra))}"
+                    )
 
             fields = []
             for b in bindings:
                 label = b.name.text
-                exp_type = expected_dict[label]
-                actual = self._infer(b.rhs, env, exp_type)
-                self._expect_type(b.rhs, actual, exp_type)
-                fields.append((label, actual))
+                if label in expected_dict:
+                    exp_type = expected_dict[label]
+                    actual = self._infer(b.rhs, env, exp_type)
+                    self._expect_type(b.rhs, actual, exp_type)
+                    fields.append((label, actual))
+                else:
+                    actual = self.infer(b.rhs, env)
+                    fields.append((label, actual))
             return TypeRecord(fields)
 
         fields = []
@@ -547,32 +673,40 @@ class TypeChecker:
             actual = self._infer(expr.expr_, env, expected.left)
             self._expect_type(expr.expr_, actual, expected.left)
             return expected
-        elif expected is not None:
+        elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_INJECTION,
                 f"Expected type {pretty_type(expected)}, but got an injection (inl)"
             )
         else:
-            raise TypeCheckError(
-                ERROR_AMBIGUOUS_SUM_TYPE,
-                "Cannot determine type of inl without expected sum type"
-            )
+            if self.ambiguous_as_bottom:
+                inner = self.infer(expr.expr_, env)
+                return TypeSum(inner, BOTTOM)
+            else:
+                raise TypeCheckError(
+                    ERROR_AMBIGUOUS_SUM_TYPE,
+                    "Cannot determine type of inl without expected sum type"
+                )
 
     def _infer_inr(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         if expected is not None and isinstance(expected, TypeSum):
             actual = self._infer(expr.expr_, env, expected.right)
             self._expect_type(expr.expr_, actual, expected.right)
             return expected
-        elif expected is not None:
+        elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_INJECTION,
                 f"Expected type {pretty_type(expected)}, but got an injection (inr)"
             )
         else:
-            raise TypeCheckError(
-                ERROR_AMBIGUOUS_SUM_TYPE,
-                "Cannot determine type of inr without expected sum type"
-            )
+            if self.ambiguous_as_bottom:
+                inner = self.infer(expr.expr_, env)
+                return TypeSum(BOTTOM, inner)
+            else:
+                raise TypeCheckError(
+                    ERROR_AMBIGUOUS_SUM_TYPE,
+                    "Cannot determine type of inr without expected sum type"
+                )
 
     def _infer_match(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         cases = list(expr.cases)
@@ -855,6 +989,8 @@ class TypeChecker:
         if not exprs:
             if expected is not None and isinstance(expected, TypeList):
                 return expected
+            elif self.ambiguous_as_bottom:
+                return TypeList(BOTTOM)
             else:
                 raise TypeCheckError(
                     ERROR_AMBIGUOUS_LIST,
@@ -925,16 +1061,23 @@ class TypeChecker:
                     actual = self._infer(expr.rhs, env, UNIT)
             return expected
 
-        elif expected is not None:
+        elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_VARIANT,
                 f"Expected type {pretty_type(expected)}, but got a variant"
             )
         else:
-            raise TypeCheckError(
-                ERROR_AMBIGUOUS_VARIANT_TYPE,
-                f"Cannot determine type of variant '{label}' without expected type"
-            )
+            if self.ambiguous_as_bottom:
+                if expr.rhs is not None:
+                    inner = self.infer(expr.rhs, env)
+                else:
+                    inner = None
+                return TypeVariant([(label, inner)])
+            else:
+                raise TypeCheckError(
+                    ERROR_AMBIGUOUS_VARIANT_TYPE,
+                    f"Cannot determine type of variant '{label}' without expected type"
+                )
 
     def _infer_fix(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         if expected is not None:
@@ -960,3 +1103,110 @@ class TypeChecker:
                     f"fix expects fn(T)->T, but got {pretty_type(inner_type)}"
                 )
             return inner_type.return_type
+
+    def _infer_ref(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if expected is not None and isinstance(expected, TypeRef):
+            actual = self._infer(expr.expr_, env, expected.inner_type)
+            self._expect_type(expr.expr_, actual, expected.inner_type)
+            return TypeRef(actual)
+        elif expected is not None and not isinstance(expected, TypeTop):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_REFERENCE,
+                f"Expected type {pretty_type(expected)}, but got a reference"
+            )
+        else:
+            inner = self.infer(expr.expr_, env)
+            return TypeRef(inner)
+
+    def _infer_deref(self, expr, env: TypeEnv) -> StellaType:
+        ref_type = self.infer(expr.expr_, env)
+        if not isinstance(ref_type, TypeRef):
+            raise TypeCheckError(
+                ERROR_NOT_A_REFERENCE,
+                f"Expected a reference type, but got {pretty_type(ref_type)}"
+            )
+        return ref_type.inner_type
+
+    def _infer_assign(self, expr, env: TypeEnv) -> StellaType:
+        lhs_type = self.infer(expr.lhs, env)
+        if not isinstance(lhs_type, TypeRef):
+            raise TypeCheckError(
+                ERROR_NOT_A_REFERENCE,
+                f"Left-hand side of assignment must be a reference, but got {pretty_type(lhs_type)}"
+            )
+        self.check(expr.rhs, lhs_type.inner_type, env)
+        return UNIT
+
+    def _infer_const_memory(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if expected is not None and isinstance(expected, TypeRef):
+            return expected
+        elif expected is not None and not isinstance(expected, TypeTop):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_MEMORY_ADDRESS,
+                f"Unexpected memory address for type {pretty_type(expected)}"
+            )
+        elif self.ambiguous_as_bottom:
+            return TypeRef(BOTTOM)
+        else:
+            raise TypeCheckError(
+                ERROR_AMBIGUOUS_REFERENCE_TYPE,
+                "Cannot determine type of memory address without expected reference type"
+            )
+
+    def _infer_panic(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if expected is not None:
+            return expected
+        elif self.ambiguous_as_bottom:
+            return BOTTOM
+        else:
+            raise TypeCheckError(
+                ERROR_AMBIGUOUS_PANIC_TYPE,
+                "Cannot determine type of panic! without expected type"
+            )
+
+    def _infer_throw(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if self.exception_type is None:
+            raise TypeCheckError(
+                ERROR_EXCEPTION_TYPE_NOT_DECLARED,
+                "Exception type not declared"
+            )
+        self.check(expr.expr_, self.exception_type, env)
+        if expected is not None:
+            return expected
+        elif self.ambiguous_as_bottom:
+            return BOTTOM
+        else:
+            raise TypeCheckError(
+                ERROR_AMBIGUOUS_THROW_TYPE,
+                "Cannot determine type of throw without expected type"
+            )
+
+    def _infer_try_catch(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if self.exception_type is None:
+            raise TypeCheckError(
+                ERROR_EXCEPTION_TYPE_NOT_DECLARED,
+                "Exception type not declared"
+            )
+        if expected is not None:
+            try_type = self._infer(expr.tryExpr, env, expected)
+            self._expect_type(expr.tryExpr, try_type, expected)
+            result_type = expected
+        else:
+            try_type = self.infer(expr.tryExpr, env)
+            result_type = try_type
+        handler_env = self._bind_pattern(expr.pat, self.exception_type, env)
+        handler_type = self._infer(expr.fallbackExpr, handler_env, result_type)
+        self._expect_type(expr.fallbackExpr, handler_type, result_type)
+        return result_type
+
+    def _infer_try_cast_as(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        self._infer(expr.tryExpr, env, None)
+        cast_type = self.parse_type(expr.type_)
+        pat_env = self._bind_pattern(expr.pattern_, cast_type, env)
+        if expected is not None:
+            branch_type = expected
+        else:
+            branch_type = self._infer(expr.expr_, pat_env, None)
+        self.check(expr.expr_, branch_type, pat_env)
+        self.check(expr.fallbackExpr, branch_type, env)
+        return branch_type

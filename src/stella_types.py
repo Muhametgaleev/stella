@@ -175,6 +175,55 @@ class TypeVariant(StellaType):
                 return (True, t)
         return (False, None)
 
+class TypeTop(StellaType):
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "Top"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TypeTop)
+
+    def __hash__(self) -> int:
+        return hash("Top")
+
+class TypeBottom(StellaType):
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "Bot"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TypeBottom)
+
+    def __hash__(self) -> int:
+        return hash("Bot")
+
+class TypeRef(StellaType):
+    def __init__(self, inner_type: StellaType):
+        self.inner_type = inner_type
+
+    def __repr__(self) -> str:
+        return f"&{repr(self.inner_type)}"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TypeRef) and self.inner_type == other.inner_type
+
+    def __hash__(self) -> int:
+        return hash(("Ref", self.inner_type))
+
 BOOL = TypeBool()
 NAT = TypeNat()
 UNIT = TypeUnit()
+TOP = TypeTop()
+BOTTOM = TypeBottom()
