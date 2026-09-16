@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 class StellaType:
 
@@ -221,6 +221,69 @@ class TypeRef(StellaType):
 
     def __hash__(self) -> int:
         return hash(("Ref", self.inner_type))
+
+class TypeVar(StellaType):
+    def __init__(self, name: str):
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TypeVar) and self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash(("TypeVar", self.name))
+
+class TypeForAll(StellaType):
+    def __init__(self, vars: List[str], body: StellaType):
+        self.vars = list(vars)
+        self.body = body
+
+    def __repr__(self) -> str:
+        vars_str = " ".join(self.vars)
+        return f"forall {vars_str}. {repr(self.body)}"
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, TypeForAll)
+            and self.vars == other.vars
+            and self.body == other.body
+        )
+
+    def __hash__(self) -> int:
+        return hash(("ForAll", tuple(self.vars), self.body))
+
+class TypeRec(StellaType):
+    def __init__(self, var: str, body: StellaType):
+        self.var = var
+        self.body = body
+
+    def __repr__(self) -> str:
+        return f"µ{self.var}.{repr(self.body)}"
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, TypeRec)
+            and self.var == other.var
+            and self.body == other.body
+        )
+
+    def __hash__(self) -> int:
+        return hash(("Rec", self.var, self.body))
+
+class TypeInferVar(StellaType):
+    def __init__(self, id: int):
+        self.id = id
+
+    def __repr__(self) -> str:
+        return f"?T{self.id}"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TypeInferVar) and self.id == other.id
+
+    def __hash__(self) -> int:
+        return hash(("InferVar", self.id))
 
 BOOL = TypeBool()
 NAT = TypeNat()

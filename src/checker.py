@@ -5,6 +5,7 @@ from stella_types import (
     StellaType, TypeBool, TypeNat, TypeUnit,
     TypeFun, TypeTuple, TypeRecord, TypeSum, TypeList, TypeVariant,
     TypeTop, TypeBottom, TypeRef,
+    TypeVar, TypeForAll, TypeRec, TypeInferVar,
     BOOL, NAT, UNIT, TOP, BOTTOM
 )
 from errors import (
@@ -25,14 +26,17 @@ from errors import (
     ERROR_AMBIGUOUS_REFERENCE_TYPE, ERROR_AMBIGUOUS_PANIC_TYPE,
     ERROR_NOT_A_REFERENCE, ERROR_UNEXPECTED_MEMORY_ADDRESS,
     ERROR_UNEXPECTED_REFERENCE, ERROR_UNEXPECTED_SUBTYPE,
+    ERROR_OCCURS_CHECK_INFINITE_TYPE, ERROR_NOT_A_GENERIC_FUNCTION,
+    ERROR_INCORRECT_NUMBER_OF_TYPE_ARGUMENTS, ERROR_UNDEFINED_TYPE_VARIABLE,
 )
+from unification import unify, apply_subst, unify_one
 from context import TypeEnv
 from pretty import pretty_type, pretty_expr
 
 class TypeChecker:
     def __init__(self, extensions: set):
         self.extensions = extensions
-        self.functions: Dict[str, TypeFun] = {}
+        self.functions: Dict[str, StellaType] = {}
         self.current_fn: Optional[str] = None
 
         self.has_pairs = '#pairs' in extensions
@@ -54,9 +58,27 @@ class TypeChecker:
         self.has_type_cast = '#type-cast' in extensions
         self.has_panic = '#panic' in extensions
 
+        self.type_reconstruction = '#type-reconstruction' in extensions
+        self.universal_types = '#universal-types' in extensions
+        self.has_recursive_types = '#recursive-types' in extensions
+        self.has_letrec = '#letrec' in extensions
+
+        self._next_var = 0
+        self.constraints: List[Tuple[StellaType, StellaType]] = []
+        self.subst: Dict[int, StellaType] = {}
+        self.current_type_vars: Set[str] = set()
+
         self.type_aliases: Dict[str, StellaType] = {}
 
-    def parse_type(self, ctx) -> StellaType:
+    def fresh_var(self) -> TypeInferVar:
+        v = TypeInferVar(self._next_var)
+        self._next_var += 1
+        return v
+
+    def parse_type(self, ctx, type_vars=None) -> StellaType:
+        if type_vars is None:
+            type_vars = set(self.current_type_vars)
+
         name = ctx.__class__.__name__
 
         if name == 'TypeBoolContext':
@@ -69,14 +91,16 @@ class TypeChecker:
             return TOP
         elif name == 'TypeBottomContext':
             return BOTTOM
+        elif name == 'TypeAutoContext':
+            return self.fresh_var()
         elif name == 'TypeRefContext':
-            return TypeRef(self.parse_type(ctx.type_))
+            return TypeRef(self.parse_type(ctx.type_, type_vars))
         elif name == 'TypeFunContext':
-            param_types = [self.parse_type(p) for p in ctx.paramTypes]
-            ret_type = self.parse_type(ctx.returnType)
+            param_types = [self.parse_type(p, type_vars) for p in ctx.paramTypes]
+            ret_type = self.parse_type(ctx.returnType, type_vars)
             return TypeFun(param_types, ret_type)
         elif name == 'TypeTupleContext':
-            types = [self.parse_type(t) for t in ctx.types]
+            types = [self.parse_type(t, type_vars) for t in ctx.types]
             return TypeTuple(types)
         elif name == 'TypeRecordContext':
             seen_labels = set()
@@ -89,15 +113,15 @@ class TypeChecker:
                         f"Duplicate field '{label}' in record type"
                     )
                 seen_labels.add(label)
-                fields.append((label, self.parse_type(ft.type_)))
+                fields.append((label, self.parse_type(ft.type_, type_vars)))
             return TypeRecord(fields)
         elif name == 'TypeSumContext':
             return TypeSum(
-                self.parse_type(ctx.left),
-                self.parse_type(ctx.right)
+                self.parse_type(ctx.left, type_vars),
+                self.parse_type(ctx.right, type_vars)
             )
         elif name == 'TypeListContext':
-            return TypeList(self.parse_type(ctx.type_))
+            return TypeList(self.parse_type(ctx.type_, type_vars))
         elif name == 'TypeVariantContext':
             seen_labels = set()
             fields = []
@@ -110,20 +134,37 @@ class TypeChecker:
                     )
                 seen_labels.add(label)
                 if ft.type_ is not None:
-                    fields.append((label, self.parse_type(ft.type_)))
+                    fields.append((label, self.parse_type(ft.type_, type_vars)))
                 else:
                     fields.append((label, None))
             return TypeVariant(fields)
         elif name == 'TypeVarContext':
             var_name = ctx.name.text
+            if var_name in type_vars:
+                return TypeVar(var_name)
             if var_name in self.type_aliases:
                 return self.type_aliases[var_name]
+            if self.universal_types or self.has_recursive_types:
+                raise TypeCheckError(
+                    ERROR_UNDEFINED_TYPE_VARIABLE,
+                    f"Undefined type variable: {var_name}"
+                )
             raise TypeCheckError(
                 ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
                 f"Undefined type: {var_name}"
             )
+        elif name == 'TypeForAllContext':
+            vars_list = [t.text for t in ctx.types]
+            new_type_vars = set(type_vars) | set(vars_list)
+            body = self.parse_type(ctx.type_, new_type_vars)
+            return TypeForAll(vars_list, body)
+        elif name == 'TypeRecContext':
+            var_name = ctx.var.text
+            new_type_vars = set(type_vars) | {var_name}
+            body = self.parse_type(ctx.type_, new_type_vars)
+            return TypeRec(var_name, body)
         elif name == 'TypeParensContext':
-            return self.parse_type(ctx.type_)
+            return self.parse_type(ctx.type_, type_vars)
         else:
             raise TypeCheckError(
                 ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
@@ -175,8 +216,25 @@ class TypeChecker:
         return False
 
     def _expect_type(self, expr, actual: StellaType, expected: StellaType):
+        if self.type_reconstruction:
+            actual_resolved = apply_subst(self.subst, actual)
+            expected_resolved = apply_subst(self.subst, expected)
+            if isinstance(actual_resolved, TypeInferVar) or isinstance(expected_resolved, TypeInferVar):
+                unify_one(actual_resolved, expected_resolved, self.subst)
+                return
+            actual = actual_resolved
+            expected = expected_resolved
+
         if self.structural_subtyping:
             if not self.is_subtype(actual, expected):
+                if isinstance(actual, TypeRecord) and isinstance(expected, TypeRecord):
+                    actual_dict = dict(actual.fields)
+                    missing = [lbl for lbl, _ in expected.fields if lbl not in actual_dict]
+                    if missing:
+                        raise TypeCheckError(
+                            ERROR_MISSING_RECORD_FIELDS,
+                            f"Missing record fields: {', '.join(sorted(missing))}"
+                        )
                 raise TypeCheckError(
                     ERROR_UNEXPECTED_SUBTYPE,
                     f"Expected type {pretty_type(expected)}, but got {pretty_type(actual)}"
@@ -203,7 +261,7 @@ class TypeChecker:
         seen_names = set()
         for decl in program_ctx.decls:
             cname = decl.__class__.__name__
-            if cname == 'DeclFunContext':
+            if cname in ('DeclFunContext', 'DeclFunGenericContext'):
                 fn_name = decl.name.text
                 if fn_name in seen_names:
                     raise TypeCheckError(
@@ -219,6 +277,10 @@ class TypeChecker:
                 fn_type = self._get_fun_type(decl)
                 self.functions[decl.name.text] = fn_type
                 global_env = global_env.extend(decl.name.text, fn_type)
+            elif cname == 'DeclFunGenericContext':
+                fn_type = self._get_generic_fun_type(decl)
+                self.functions[decl.name.text] = fn_type
+                global_env = global_env.extend(decl.name.text, fn_type)
 
         if 'main' not in self.functions:
             raise TypeCheckError(
@@ -230,21 +292,41 @@ class TypeChecker:
             cname = decl.__class__.__name__
             if cname == 'DeclFunContext':
                 self._check_fun_decl(decl, global_env)
+            elif cname == 'DeclFunGenericContext':
+                self._check_generic_fun_decl(decl, global_env)
 
-    def _get_fun_type(self, decl) -> TypeFun:
+        if self.type_reconstruction and self.constraints:
+            self.subst = unify(self.constraints, self.subst)
+            self.constraints = []
+
+    def _get_fun_type(self, decl, type_vars=None) -> TypeFun:
+        if type_vars is None:
+            type_vars = set()
         param_types = []
         for pd in decl.paramDecls:
-            param_types.append(self.parse_type(pd.paramType))
+            param_types.append(self.parse_type(pd.paramType, type_vars))
 
         if decl.returnType is not None:
-            ret_type = self.parse_type(decl.returnType)
+            ret_type = self.parse_type(decl.returnType, type_vars)
         else:
             ret_type = UNIT
 
         return TypeFun(param_types, ret_type)
 
-    def _check_fun_decl(self, decl, global_env: TypeEnv):
+    def _get_generic_fun_type(self, decl) -> TypeForAll:
+        generics = [g.text for g in decl.generics]
+        type_vars = set(generics)
+        param_types = [self.parse_type(pd.paramType, type_vars) for pd in decl.paramDecls]
+        ret_type = self.parse_type(decl.returnType, type_vars) if decl.returnType else UNIT
+        return TypeForAll(generics, TypeFun(param_types, ret_type))
+
+    def _check_fun_decl(self, decl, global_env: TypeEnv, type_vars=None):
+        if type_vars is None:
+            type_vars = set()
         self.current_fn = decl.name.text
+        old_type_vars = self.current_type_vars
+        self.current_type_vars = set(type_vars)
+
         fn_type = self.functions[decl.name.text]
 
         env = global_env
@@ -255,7 +337,7 @@ class TypeChecker:
         for local_decl in decl.localDecls:
             local_cname = local_decl.__class__.__name__
             if local_cname == 'DeclFunContext':
-                local_fn_type = self._get_fun_type(local_decl)
+                local_fn_type = self._get_fun_type(local_decl, type_vars)
                 local_functions[local_decl.name.text] = local_fn_type
                 env = env.extend(local_decl.name.text, local_fn_type)
 
@@ -264,7 +346,7 @@ class TypeChecker:
             if local_cname == 'DeclFunContext':
                 old_fn = self.functions.get(local_decl.name.text)
                 self.functions[local_decl.name.text] = local_functions[local_decl.name.text]
-                self._check_fun_decl(local_decl, env)
+                self._check_fun_decl(local_decl, env, type_vars)
                 if old_fn is None:
                     del self.functions[local_decl.name.text]
                 else:
@@ -273,6 +355,33 @@ class TypeChecker:
         ret_type = fn_type.return_type
         actual = self.infer_with_expected(decl.returnExpr, env, ret_type)
         self._expect_type(decl.returnExpr, actual, ret_type)
+
+        self.current_type_vars = old_type_vars
+
+    def _check_generic_fun_decl(self, decl, global_env: TypeEnv):
+        self.current_fn = decl.name.text
+        generics = [g.text for g in decl.generics]
+        old_type_vars = self.current_type_vars
+        self.current_type_vars = set(generics)
+
+        fn_forall = self.functions[decl.name.text]
+        fn_type = fn_forall.body
+
+        env = global_env
+        for pd, param_type in zip(decl.paramDecls, fn_type.param_types):
+            env = env.extend(pd.name.text, param_type)
+
+        for local_decl in decl.localDecls:
+            if local_decl.__class__.__name__ == 'DeclFunContext':
+                local_fn_type = self._get_fun_type(local_decl, set(generics))
+                self.functions[local_decl.name.text] = local_fn_type
+                env = env.extend(local_decl.name.text, local_fn_type)
+
+        ret_type = fn_type.return_type
+        actual = self.infer_with_expected(decl.returnExpr, env, ret_type)
+        self._expect_type(decl.returnExpr, actual, ret_type)
+
+        self.current_type_vars = old_type_vars
 
     def infer_with_expected(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         return self._infer(expr, env, expected)
@@ -310,6 +419,8 @@ class TypeChecker:
                     ERROR_UNDEFINED_VARIABLE,
                     f"Undefined variable: {var_name}"
                 )
+            if self.type_reconstruction:
+                t = apply_subst(self.subst, t)
             return t
 
         if name == 'SuccContext':
@@ -442,7 +553,7 @@ class TypeChecker:
             return self._infer_ref(expr, env, expected)
 
         if name == 'DerefContext':
-            return self._infer_deref(expr, env)
+            return self._infer_deref(expr, env, expected)
 
         if name == 'AssignContext':
             return self._infer_assign(expr, env)
@@ -479,6 +590,21 @@ class TypeChecker:
         if name == 'TryCastAsContext':
             return self._infer_try_cast_as(expr, env, expected)
 
+        if name == 'TypeAbstractionContext':
+            return self._infer_type_abstraction(expr, env, expected)
+
+        if name == 'TypeApplicationContext':
+            return self._infer_type_application(expr, env, expected)
+
+        if name == 'FoldContext':
+            return self._infer_fold(expr, env, expected)
+
+        if name == 'UnfoldContext':
+            return self._infer_unfold(expr, env, expected)
+
+        if name == 'LetRecContext':
+            return self._infer_letrec(expr, env, expected)
+
         raise TypeCheckError(
             ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
             f"Unsupported expression type: {name}"
@@ -487,14 +613,27 @@ class TypeChecker:
     def _infer_abstraction(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         params = list(expr.paramDecls)
 
+        if self.type_reconstruction and expected is not None:
+            expected = apply_subst(self.subst, expected)
+
+        if expected is not None and not isinstance(expected, (TypeFun, TypeInferVar, TypeTop)):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_LAMBDA,
+                f"Expected type {pretty_type(expected)}, but got a lambda"
+            )
+
         if expected is not None and isinstance(expected, TypeFun):
             if len(params) == len(expected.param_types):
                 param_types = expected.param_types
                 annotated_params = []
                 for pd, exp_pt in zip(params, param_types):
                     ann_type = self.parse_type(pd.paramType)
-                    self._expect_type(pd, ann_type, exp_pt)
-                    annotated_params.append(ann_type)
+                    if not isinstance(ann_type, TypeInferVar) and ann_type != exp_pt:
+                        raise TypeCheckError(
+                            ERROR_UNEXPECTED_TYPE_FOR_PARAMETER,
+                            f"Expected parameter type {pretty_type(exp_pt)}, but got {pretty_type(ann_type)}"
+                        )
+                    annotated_params.append(ann_type if not isinstance(ann_type, TypeInferVar) else exp_pt)
 
                 new_env = env
                 for pd, pt in zip(params, annotated_params):
@@ -504,6 +643,18 @@ class TypeChecker:
                 body_type = self._infer(expr.returnExpr, new_env, body_expected)
                 self._expect_type(expr.returnExpr, body_type, body_expected)
                 return TypeFun(annotated_params, body_type)
+
+        if self.type_reconstruction and expected is not None and isinstance(expected, TypeInferVar):
+            param_types = []
+            new_env = env
+            for pd in params:
+                ann_type = self.parse_type(pd.paramType)
+                param_types.append(ann_type)
+                new_env = new_env.extend(pd.name.text, ann_type)
+            body_type = self.infer(expr.returnExpr, new_env)
+            fun_type = TypeFun(param_types, body_type)
+            unify_one(expected, fun_type, self.subst)
+            return fun_type
 
         param_types = []
         new_env = env
@@ -525,6 +676,24 @@ class TypeChecker:
 
     def _infer_application(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
         fun_type = self._infer(expr.fun, env, None)
+
+        if self.type_reconstruction:
+            fun_type = apply_subst(self.subst, fun_type)
+
+        if self.type_reconstruction and not isinstance(fun_type, TypeFun):
+            args = list(expr.args)
+            param_vars = [self.fresh_var() for _ in args]
+            ret_var = self.fresh_var()
+            new_fun_type = TypeFun(param_vars, ret_var)
+            unify_one(fun_type, new_fun_type, self.subst)
+            fun_type = apply_subst(self.subst, fun_type)
+        elif isinstance(fun_type, TypeInferVar):
+            args = list(expr.args)
+            param_vars = [self.fresh_var() for _ in args]
+            ret_var = self.fresh_var()
+            new_fun_type = TypeFun(param_vars, ret_var)
+            unify_one(fun_type, new_fun_type, self.subst)
+            fun_type = apply_subst(self.subst, fun_type)
 
         if not isinstance(fun_type, TypeFun):
             raise TypeCheckError(
@@ -583,6 +752,15 @@ class TypeChecker:
 
         index = int(expr.index.text)
 
+        if self.type_reconstruction:
+            tuple_type = apply_subst(self.subst, tuple_type)
+
+        if isinstance(tuple_type, TypeInferVar) and self.type_reconstruction:
+            size = max(index, 2) if self.has_pairs else index
+            elem_vars = [self.fresh_var() for _ in range(size)]
+            unify_one(tuple_type, TypeTuple(elem_vars), self.subst)
+            return apply_subst(self.subst, elem_vars[index - 1])
+
         if not isinstance(tuple_type, TypeTuple):
             raise TypeCheckError(
                 ERROR_NOT_A_TUPLE,
@@ -597,6 +775,12 @@ class TypeChecker:
         return tuple_type.types[index - 1]
 
     def _infer_record(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if expected is not None and not isinstance(expected, (TypeRecord, TypeInferVar, TypeTop)):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_RECORD,
+                f"Expected type {pretty_type(expected)}, but got a record"
+            )
+
         bindings = list(expr.bindings)
 
         seen = set()
@@ -669,10 +853,19 @@ class TypeChecker:
         return field_type
 
     def _infer_inl(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if self.type_reconstruction and expected is not None:
+            expected = apply_subst(self.subst, expected)
+
         if expected is not None and isinstance(expected, TypeSum):
             actual = self._infer(expr.expr_, env, expected.left)
             self._expect_type(expr.expr_, actual, expected.left)
             return expected
+        elif expected is not None and isinstance(expected, TypeInferVar) and self.type_reconstruction:
+            inner = self.infer(expr.expr_, env)
+            right_var = self.fresh_var()
+            sum_type = TypeSum(inner, right_var)
+            unify_one(expected, sum_type, self.subst)
+            return apply_subst(self.subst, sum_type)
         elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_INJECTION,
@@ -682,6 +875,10 @@ class TypeChecker:
             if self.ambiguous_as_bottom:
                 inner = self.infer(expr.expr_, env)
                 return TypeSum(inner, BOTTOM)
+            elif self.type_reconstruction:
+                inner = self.infer(expr.expr_, env)
+                right_var = self.fresh_var()
+                return TypeSum(inner, right_var)
             else:
                 raise TypeCheckError(
                     ERROR_AMBIGUOUS_SUM_TYPE,
@@ -689,10 +886,19 @@ class TypeChecker:
                 )
 
     def _infer_inr(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if self.type_reconstruction and expected is not None:
+            expected = apply_subst(self.subst, expected)
+
         if expected is not None and isinstance(expected, TypeSum):
             actual = self._infer(expr.expr_, env, expected.right)
             self._expect_type(expr.expr_, actual, expected.right)
             return expected
+        elif expected is not None and isinstance(expected, TypeInferVar) and self.type_reconstruction:
+            inner = self.infer(expr.expr_, env)
+            left_var = self.fresh_var()
+            sum_type = TypeSum(left_var, inner)
+            unify_one(expected, sum_type, self.subst)
+            return apply_subst(self.subst, sum_type)
         elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_INJECTION,
@@ -702,6 +908,10 @@ class TypeChecker:
             if self.ambiguous_as_bottom:
                 inner = self.infer(expr.expr_, env)
                 return TypeSum(BOTTOM, inner)
+            elif self.type_reconstruction:
+                inner = self.infer(expr.expr_, env)
+                left_var = self.fresh_var()
+                return TypeSum(left_var, inner)
             else:
                 raise TypeCheckError(
                     ERROR_AMBIGUOUS_SUM_TYPE,
@@ -734,7 +944,8 @@ class TypeChecker:
 
             covered.add(self._pattern_label(pat))
 
-        self._check_exhaustive(matched_type, covered, expr)
+        resolved_matched = apply_subst(self.subst, matched_type) if self.type_reconstruction else matched_type
+        self._check_exhaustive(resolved_matched, covered, expr)
 
         return result_type if result_type is not None else UNIT
 
@@ -871,22 +1082,32 @@ class TypeChecker:
             return self._bind_pattern(pat.pattern_, NAT, env)
 
         if name == 'PatternInlContext':
+            if self.type_reconstruction and isinstance(matched_type, TypeInferVar):
+                sum_left = self.fresh_var()
+                sum_right = self.fresh_var()
+                unify_one(matched_type, TypeSum(sum_left, sum_right), self.subst)
+                resolved = apply_subst(self.subst, matched_type)
+                return self._bind_pattern(pat.pattern_, resolved.left, env)
             if isinstance(matched_type, TypeSum):
                 return self._bind_pattern(pat.pattern_, matched_type.left, env)
-            else:
-                raise TypeCheckError(
-                    ERROR_UNEXPECTED_PATTERN_FOR_TYPE,
-                    f"Pattern inl(...) does not match type {pretty_type(matched_type)}"
-                )
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_PATTERN_FOR_TYPE,
+                f"Pattern inl(...) does not match type {pretty_type(matched_type)}"
+            )
 
         if name == 'PatternInrContext':
+            if self.type_reconstruction and isinstance(matched_type, TypeInferVar):
+                sum_left = self.fresh_var()
+                sum_right = self.fresh_var()
+                unify_one(matched_type, TypeSum(sum_left, sum_right), self.subst)
+                resolved = apply_subst(self.subst, matched_type)
+                return self._bind_pattern(pat.pattern_, resolved.right, env)
             if isinstance(matched_type, TypeSum):
                 return self._bind_pattern(pat.pattern_, matched_type.right, env)
-            else:
-                raise TypeCheckError(
-                    ERROR_UNEXPECTED_PATTERN_FOR_TYPE,
-                    f"Pattern inr(...) does not match type {pretty_type(matched_type)}"
-                )
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_PATTERN_FOR_TYPE,
+                f"Pattern inr(...) does not match type {pretty_type(matched_type)}"
+            )
 
         if name == 'PatternTupleContext':
             patterns = list(pat.patterns)
@@ -984,6 +1205,12 @@ class TypeChecker:
         return env
 
     def _infer_list(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if expected is not None and not isinstance(expected, (TypeList, TypeInferVar, TypeTop)):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_LIST,
+                f"Expected type {pretty_type(expected)}, but got a list"
+            )
+
         exprs = list(expr.exprs)
 
         if not exprs:
@@ -991,6 +1218,8 @@ class TypeChecker:
                 return expected
             elif self.ambiguous_as_bottom:
                 return TypeList(BOTTOM)
+            elif self.type_reconstruction:
+                return TypeList(self.fresh_var())
             else:
                 raise TypeCheckError(
                     ERROR_AMBIGUOUS_LIST,
@@ -1080,6 +1309,13 @@ class TypeChecker:
                 )
 
     def _infer_fix(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        if self.type_reconstruction and expected is None:
+            ret_var = self.fresh_var()
+            fun_type = TypeFun([ret_var], ret_var)
+            actual = self._infer(expr.expr_, env, fun_type)
+            self._expect_type(expr.expr_, actual, fun_type)
+            return apply_subst(self.subst, ret_var)
+
         if expected is not None:
             fun_type = TypeFun([expected], expected)
             actual = self._infer(expr.expr_, env, fun_type)
@@ -1108,7 +1344,7 @@ class TypeChecker:
         if expected is not None and isinstance(expected, TypeRef):
             actual = self._infer(expr.expr_, env, expected.inner_type)
             self._expect_type(expr.expr_, actual, expected.inner_type)
-            return TypeRef(actual)
+            return expected
         elif expected is not None and not isinstance(expected, TypeTop):
             raise TypeCheckError(
                 ERROR_UNEXPECTED_REFERENCE,
@@ -1118,8 +1354,12 @@ class TypeChecker:
             inner = self.infer(expr.expr_, env)
             return TypeRef(inner)
 
-    def _infer_deref(self, expr, env: TypeEnv) -> StellaType:
-        ref_type = self.infer(expr.expr_, env)
+    def _infer_deref(self, expr, env: TypeEnv, expected: Optional[StellaType] = None) -> StellaType:
+        inner_expected = TypeRef(expected) if expected is not None else None
+        ref_type = self._infer(expr.expr_, env, inner_expected)
+        if self.type_reconstruction:
+            from unification import apply_subst
+            ref_type = apply_subst(self.subst, ref_type)
         if not isinstance(ref_type, TypeRef):
             raise TypeCheckError(
                 ERROR_NOT_A_REFERENCE,
@@ -1210,3 +1450,130 @@ class TypeChecker:
         self.check(expr.expr_, branch_type, pat_env)
         self.check(expr.fallbackExpr, branch_type, env)
         return branch_type
+
+    def _infer_type_abstraction(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        generics = [g.text for g in expr.generics]
+        old_type_vars = self.current_type_vars
+        self.current_type_vars = set(generics)
+
+        body_expected = None
+        if expected is not None and isinstance(expected, TypeForAll):
+            if expected.vars == generics:
+                body_expected = expected.body
+
+        body_type = self._infer(expr.expr_, env, body_expected)
+        self.current_type_vars = old_type_vars
+        return TypeForAll(generics, body_type)
+
+    def _infer_type_application(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        fun_type = self._infer(expr.fun, env, None)
+
+        if self.type_reconstruction:
+            fun_type = apply_subst(self.subst, fun_type)
+
+        if not isinstance(fun_type, TypeForAll):
+            raise TypeCheckError(
+                ERROR_NOT_A_GENERIC_FUNCTION,
+                f"Expected a generic (forall) function, but got {pretty_type(fun_type)}"
+                + (f" for expression {pretty_expr(expr.fun)}" if expr.fun is not None else "")
+            )
+
+        type_args = [self.parse_type(t) for t in expr.types]
+
+        if len(type_args) != len(fun_type.vars):
+            raise TypeCheckError(
+                ERROR_INCORRECT_NUMBER_OF_TYPE_ARGUMENTS,
+                f"Generic function expects {len(fun_type.vars)} type arguments, "
+                f"but got {len(type_args)}"
+            )
+
+        result = self.subst_type_vars(fun_type.body, dict(zip(fun_type.vars, type_args)))
+        return result
+
+    def _infer_fold(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        rec_type = self.parse_type(expr.type_)
+        if not isinstance(rec_type, TypeRec):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
+                f"fold expects a recursive type annotation, but got {pretty_type(rec_type)}"
+            )
+        unfolded = self.unfold_rec(rec_type)
+        actual = self._infer(expr.expr_, env, unfolded)
+        self._expect_type(expr.expr_, actual, unfolded)
+        return rec_type
+
+    def _infer_unfold(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        rec_type = self.parse_type(expr.type_)
+        if not isinstance(rec_type, TypeRec):
+            raise TypeCheckError(
+                ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION,
+                f"unfold expects a recursive type annotation, but got {pretty_type(rec_type)}"
+            )
+        actual = self._infer(expr.expr_, env, rec_type)
+        self._expect_type(expr.expr_, actual, rec_type)
+        return self.unfold_rec(rec_type)
+
+    def _infer_letrec(self, expr, env: TypeEnv, expected: Optional[StellaType]) -> StellaType:
+        new_env = env
+        binding_types = []
+        for pb in expr.patternBindings:
+            if self.type_reconstruction:
+                bvar = self.fresh_var()
+                binding_types.append(bvar)
+                new_env = self._bind_pattern(pb.pat, bvar, new_env)
+            else:
+                rhs_type = self.infer(pb.rhs, new_env)
+                binding_types.append(rhs_type)
+                new_env = self._bind_pattern(pb.pat, rhs_type, new_env)
+
+        if self.type_reconstruction:
+            for pb, btype in zip(expr.patternBindings, binding_types):
+                actual = self._infer(pb.rhs, new_env, btype)
+                self._expect_type(pb.rhs, actual, btype)
+
+        return self._infer(expr.body, new_env, expected)
+
+    def unfold_rec(self, rec_type: TypeRec) -> StellaType:
+        return self.subst_type_var(rec_type.body, rec_type.var, rec_type)
+
+    def subst_type_var(self, t: StellaType, var_name: str, replacement: StellaType) -> StellaType:
+        return self.subst_type_vars(t, {var_name: replacement})
+
+    def subst_type_vars(self, t: StellaType, mapping: Dict[str, StellaType]) -> StellaType:
+        if isinstance(t, TypeVar):
+            return mapping.get(t.name, t)
+        elif isinstance(t, TypeFun):
+            return TypeFun(
+                [self.subst_type_vars(p, mapping) for p in t.param_types],
+                self.subst_type_vars(t.return_type, mapping)
+            )
+        elif isinstance(t, TypeTuple):
+            return TypeTuple([self.subst_type_vars(e, mapping) for e in t.types])
+        elif isinstance(t, TypeRecord):
+            return TypeRecord([(lbl, self.subst_type_vars(ty, mapping)) for lbl, ty in t.fields])
+        elif isinstance(t, TypeSum):
+            return TypeSum(
+                self.subst_type_vars(t.left, mapping),
+                self.subst_type_vars(t.right, mapping)
+            )
+        elif isinstance(t, TypeList):
+            return TypeList(self.subst_type_vars(t.element_type, mapping))
+        elif isinstance(t, TypeVariant):
+            return TypeVariant([
+                (lbl, self.subst_type_vars(ty, mapping) if ty is not None else None)
+                for lbl, ty in t.fields
+            ])
+        elif isinstance(t, TypeRef):
+            return TypeRef(self.subst_type_vars(t.inner_type, mapping))
+        elif isinstance(t, TypeForAll):
+            inner_mapping = {k: v for k, v in mapping.items() if k not in t.vars}
+            if not inner_mapping:
+                return t
+            return TypeForAll(t.vars, self.subst_type_vars(t.body, inner_mapping))
+        elif isinstance(t, TypeRec):
+            inner_mapping = {k: v for k, v in mapping.items() if k != t.var}
+            if not inner_mapping:
+                return t
+            return TypeRec(t.var, self.subst_type_vars(t.body, inner_mapping))
+        else:
+            return t
